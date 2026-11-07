@@ -1,0 +1,1058 @@
+//+------------------------------------------------------------------+
+//|                                         DynamicTimeAnalysis.mq5  |
+//|                                  Copyright 2026, AI Financial    |
+//|                                             https://mql5.com     |
+//+------------------------------------------------------------------+
+#property indicator_chart_window
+#property indicator_buffers 2
+#property indicator_plots   1
+#property indicator_type1   DRAW_ZIGZAG
+#property indicator_color1  clrDeepSkyBlue
+#property indicator_width1  2
+
+//--- Inputs định hướng thiết kế nghiêm ngặt DTA 1.0 V2 sau Audit D_29
+input string   InpGroupPivot  = "=== PIVOT ENGINE ===";
+input int      InpDepth       = 6;             // Khung nến đối xứng xác nhận cực trị
+input int      InpATRPeriod   = 14;            // Chu kỳ ATR động
+input int      InpMedianPeriod= 100;           // Chu kỳ tính ATR Median lịch sử
+input string   InpGroupStat   = "=== CYCLE STATISTICS ===";
+input int      InpMaxPivots   = 12;            // Khóa cứng 12 Đỉnh + 12 Đáy độc lập (Phương án B)
+input int      InpMinCycles   = 5;             // Tối thiểu 5 chu kỳ thực tế (Đòi hỏi 6 mẫu, giới hạn <= 11)
+input string   InpGroupLog    = "=== LOGGING SYSTEM ===";
+input string   InpLogFileName = "DTA_State_Snapshot_Log.csv"; // Snapshot Log chuẩn hóa
+
+//--- Định nghĩa trạng thái Depth Qualification rõ ràng
+enum ENUM_QUALIFICATION
+  {
+   QUAL_NOT_EVALUATED,
+   QUALIFIED,
+   QUAL_REJECTED
+  };
+
+//--- Định nghĩa trạng thái Candidate quản lý Recovery Mode chuẩn xác
+enum ENUM_CANDIDATE_MODE
+  {
+   CANDIDATE_ACTIVE,
+   CANDIDATE_RECOVERY
+  };
+
+//--- Phân loại kết quả Commit chi tiết
+enum ENUM_COMMIT_RESULT
+  {
+   COMMIT_SUCCESS,
+   COMMIT_RETRY,
+   COMMIT_REJECTED,
+   COMMIT_FATAL_ERROR
+  };
+
+//--- Phân loại kết quả Transfer/Reconstruct chi tiết
+enum ENUM_TRANSFER_RESULT
+  {
+   TRANSFER_SUCCESS,
+   TRANSFER_RETRY,
+   TRANSFER_REJECTED,     
+   TRANSFER_FATAL_ERROR
+  };
+
+//--- Phân loại kết quả Push Database chi tiết
+enum ENUM_DB_RESULT
+  {
+   DB_SUCCESS,
+   DB_RETRY,
+   DB_REJECTED,
+   DB_FATAL_ERROR
+  };
+
+//--- Định nghĩa cấu trúc chuẩn dữ liệu DTA 1.0 mở rộng
+struct PivotPoint
+  {
+   int      bar_index;
+   datetime time;
+   double   price;
+   int      type;              // 1 = Peak, -1 = Trough
+   datetime condition_confirmation_time;
+   int      condition_confirmation_bar;
+   datetime sequence_confirmation_time;
+   int      sequence_confirmation_bar;
+   datetime confirmation_time; 
+   int      confirmation_bar;  
+   double   atr_at_cand;
+   double   median_at_cand;
+   double   k_at_cand;
+   double   threshold_at_cand;
+  };
+
+//--- Cấu trúc Candidate Tracker mở rộng
+struct CandidateTracker
+  {
+   int      bar_index;
+   double   price;
+   datetime time;
+   double   atr;
+   double   median;
+   double   k;
+   double   threshold;
+   ENUM_QUALIFICATION depth_status;
+   int      depth_confirm_bar;
+   bool     is_atr_qualified;
+   int      atr_confirm_bar;
+   bool     has_valid_atr;
+   ENUM_CANDIDATE_MODE mode;
+   int      recovery_start_bar;
+  };
+
+enum ENUM_DTA_STATE { STATE_BOOTSTRAP, STATE_SEEKING_PEAK, STATE_SEEKING_TROUGH };
+
+double         ZigZagHighBuffer[];
+double         ZigZagLowBuffer[];
+
+//--- DATABASE LAYER: Hệ thống mảng lưu trữ Chronological Sequence
+PivotPoint     all_pivots[];       
+PivotPoint     tracked_peaks[];    
+PivotPoint     tracked_troughs[];  
+
+int            AtrHandle = INVALID_HANDLE;
+double         AtrBuffer[];
+datetime       last_rates_time = 0; 
+int            last_rates_total = 0;
+
+int            last_logged_start = 0;
+int            last_logged_end = 0;
+string         last_logged_status = "";
+string         last_logged_pivot_sign = ""; 
+
+//--- Khai báo nguyên mẫu các module xử lý Pivot Engine V2 & Projection
+void           UpdateExtremeCandidate(CandidateTracker &cand, int bar, double price, datetime t, double atr, double med, double k, double thresh, bool valid_atr);
+void           EvaluateDepthQualification(const double &high[], const double &low[], CandidateTracker &cand, int i, int depth, int type, int rates_total);
+bool           EvaluateATRReversal(const double &high[], const double &low[], CandidateTracker &cand, int i, int type);
+ENUM_COMMIT_RESULT CommitConfirmedPivot(CandidateTracker &cand, CandidateTracker &opp_cand, int i, const datetime &time[], const double &high[], const double &low[], int type, int rates_total);
+ENUM_TRANSFER_RESULT TransferAndReconstructActiveCandidates(CandidateTracker &cand, CandidateTracker &opp_cand, int commit_bar, int confirm_bar, const double &high[], const double &low[], const datetime &time[], const double &atr_buf[], int committed_type, int rates_total);
+bool           CheckSymmetricDepth(const double &high[], const double &low[], int bar_index, int type, int depth, int rates_total);
+ENUM_DB_RESULT PushToChronologicalDatabase(int bar, datetime t, double price, int type, datetime cond_t, int cond_b, datetime seq_t, int seq_b, double atr, double med, double k, double thresh, const double &high[], const double &low[], int rates_total);
+bool           PopulateSubArrays();
+bool           ExecuteDualProjectionCore();
+bool           CalculateMedianInt(const int &values[], double &result);
+void           WriteStatefulLog(string status, int start_b, int end_b, double m_hh, double m_ll, double m_pt, double m_tp);
+void           CreateDTA10Dashboard();
+void           CreateDTA10Label(string name, string text, int x, int y, int size, color col);
+void           UpdateDTA10DashboardFields(string ind, string alt, string core, string est_time);
+void           UpdateDTA10Field(string name, string text);
+
+//+------------------------------------------------------------------+
+//| Custom indicator initialization function                         |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   if(InpDepth != 6 || InpATRPeriod != 14 || InpMedianPeriod != 100 || InpMaxPivots != 12 || InpMinCycles < 5 || InpMinCycles > InpMaxPivots - 1)
+     {
+      Print("DTA 1.0 V2 Error: Cấu hình tham số đầu vào vi phạm đặc tả.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   SetIndexBuffer(0, ZigZagHighBuffer, INDICATOR_DATA);
+   SetIndexBuffer(1, ZigZagLowBuffer, INDICATOR_DATA);
+   ArraySetAsSeries(ZigZagHighBuffer, true);
+   ArraySetAsSeries(ZigZagLowBuffer, true);
+   
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   ArrayInitialize(ZigZagHighBuffer, EMPTY_VALUE);
+   ArrayInitialize(ZigZagLowBuffer, EMPTY_VALUE);
+   
+   AtrHandle = iATR(_Symbol, _Period, InpATRPeriod);
+   if(AtrHandle == INVALID_HANDLE) return(INIT_FAILED);
+   CreateDTA10Dashboard();
+   return(INIT_SUCCEEDED);
+  }
+
+void OnDeinit(const int reason)
+  {
+   if(AtrHandle != INVALID_HANDLE) IndicatorRelease(AtrHandle);
+   ObjectsDeleteAll(0, "DTA10_");
+  }
+
+//+------------------------------------------------------------------+
+//| Custom indicator iteration function                              |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   ArraySetAsSeries(time, true);
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(AtrBuffer, true);
+   
+   // Tối ưu vị trí kiểm tra cache lên trước CopyBuffer để tiết kiệm tài nguyên tick (Audit D_29)[cite: 14]
+   datetime current_last_time = time[0];
+   if(prev_calculated > 0 && rates_total == last_rates_total && current_last_time == last_rates_time) 
+      return(rates_total);
+      
+   if(rates_total < InpMedianPeriod + InpATRPeriod + InpDepth + 2) return(0);
+   if(BarsCalculated(AtrHandle) < rates_total) return(0);
+   
+   int copied = CopyBuffer(AtrHandle, 0, 0, rates_total, AtrBuffer);
+   if(copied < rates_total) return(0); 
+   
+   last_rates_time = current_last_time;
+   last_rates_total = rates_total;
+   
+   ArrayInitialize(ZigZagHighBuffer, EMPTY_VALUE);
+   ArrayInitialize(ZigZagLowBuffer, EMPTY_VALUE);
+   
+   if(ArrayResize(all_pivots, 0) < 0 || ArrayResize(tracked_peaks, 0) < 0 || ArrayResize(tracked_troughs, 0) < 0)
+     {
+      Print("DTA Error: Failed to reset database arrays.");
+      last_rates_time = 0;
+      last_rates_total = 0;
+      return(0);
+     }
+   
+   ENUM_DTA_STATE current_state = STATE_BOOTSTRAP;
+   
+   CandidateTracker cand;     ZeroMemory(cand);     cand.bar_index = -1;
+   CandidateTracker opp_cand; ZeroMemory(opp_cand); opp_cand.bar_index = -1;
+   
+   double temp_atr[];
+   if(ArrayResize(temp_atr, InpMedianPeriod) != InpMedianPeriod)
+     {
+      Print("DTA Error: Cannot allocate ATR median buffer.");
+      last_rates_time = 0;
+      last_rates_total = 0;
+      return(0);
+     }
+   
+   // Sửa vùng khởi tạo ATR theo Audit D_29 (cung cấp đủ khoảng đệm cho ATRPeriod và MedianPeriod)[cite: 14]
+   int scan_start = rates_total - InpMedianPeriod - InpATRPeriod - 1;
+   for(int i = scan_start; i >= 1; i--)
+     {
+      double current_atr = AtrBuffer[i];
+      bool atr_valid = (MathIsValidNumber(current_atr) && current_atr > 0 && current_atr != EMPTY_VALUE);
+      double valid_atr = atr_valid ? current_atr : 0.0;
+      
+      bool median_valid = true;
+      for(int m = 0; m < InpMedianPeriod; m++) 
+        {
+         temp_atr[m] = AtrBuffer[i + m];
+         if(!MathIsValidNumber(temp_atr[m]) || temp_atr[m] <= 0 || temp_atr[m] == EMPTY_VALUE) median_valid = false;
+        }
+      
+      double median_atr = 0.0;
+      if(median_valid)
+        {
+         ArraySort(temp_atr);
+         int mid = InpMedianPeriod / 2;
+         median_atr = (InpMedianPeriod % 2 == 0) ? (temp_atr[mid-1] + temp_atr[mid])/2.0 : temp_atr[mid];
+         if(!MathIsValidNumber(median_atr) || median_atr <= 0) median_valid = false;
+        }
+      
+      double k_t = 1.0;
+      double loop_threshold = 0.0;
+      if(atr_valid && median_valid)
+        {
+         double ratio = valid_atr / median_atr;
+         k_t = (ratio < 0.8) ? 0.8 : (ratio < 1.2) ? 1.0 : (ratio < 1.6) ? 1.5 : 2.0;
+         loop_threshold = valid_atr * k_t;
+        }
+      
+      if(current_state == STATE_BOOTSTRAP)
+        {
+         current_state = STATE_SEEKING_TROUGH;
+         UpdateExtremeCandidate(cand, i, low[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+         UpdateExtremeCandidate(opp_cand, i, high[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+         continue;
+        }
+      
+      if(current_state == STATE_SEEKING_PEAK)
+        {
+         if(cand.bar_index != -1 && i < cand.bar_index)
+           {
+            if(high[i] > cand.price)
+              {
+               UpdateExtremeCandidate(cand, i, high[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+              }
+              
+            if(cand.mode == CANDIDATE_ACTIVE)
+              {
+               EvaluateDepthQualification(high, low, cand, i, InpDepth, 1, rates_total);
+              }
+            
+            if(opp_cand.bar_index == -1 || low[i] < opp_cand.price)
+              {
+               UpdateExtremeCandidate(opp_cand, i, low[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+              }
+            EvaluateDepthQualification(high, low, opp_cand, i, InpDepth, -1, rates_total);
+            EvaluateATRReversal(high, low, opp_cand, i, -1);
+           }
+         EvaluateATRReversal(high, low, cand, i, 1);
+         
+         if(cand.bar_index != -1 && cand.depth_status == QUALIFIED && cand.is_atr_qualified && cand.has_valid_atr)
+           {
+            int confirmation_bar = (cand.depth_confirm_bar < cand.atr_confirm_bar) ? cand.depth_confirm_bar : cand.atr_confirm_bar;
+            if(i <= confirmation_bar)
+              {
+               ENUM_COMMIT_RESULT commit_res = CommitConfirmedPivot(cand, opp_cand, i, time, high, low, 1, rates_total);
+               if(commit_res == COMMIT_SUCCESS)
+                 {
+                  current_state = STATE_SEEKING_TROUGH;
+                 }
+               else if(commit_res == COMMIT_RETRY)
+                 {
+                  last_rates_time = 0;
+                  last_rates_total = 0;
+                  return(0);
+                 }
+               else if(commit_res == COMMIT_REJECTED)
+                 {
+                  cand.depth_status = QUAL_REJECTED;
+                  cand.mode = CANDIDATE_RECOVERY;
+                 }
+               else if(commit_res == COMMIT_FATAL_ERROR)
+                 {
+                  Print("DTA Fatal Error: Commit failed with fatal error at bar ", i);
+                  last_rates_time = 0;
+                  last_rates_total = 0;
+                  return(0);
+                 }
+              }
+           }
+        }
+      else if(current_state == STATE_SEEKING_TROUGH)
+        {
+         if(cand.bar_index != -1 && i < cand.bar_index)
+           {
+            if(low[i] < cand.price)
+              {
+               UpdateExtremeCandidate(cand, i, low[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+              }
+              
+            if(cand.mode == CANDIDATE_ACTIVE)
+              {
+               EvaluateDepthQualification(high, low, cand, i, InpDepth, -1, rates_total);
+              }
+            
+            if(opp_cand.bar_index == -1 || high[i] > opp_cand.price)
+              {
+               UpdateExtremeCandidate(opp_cand, i, high[i], time[i], valid_atr, median_atr, k_t, loop_threshold, atr_valid && median_valid);
+              }
+            EvaluateDepthQualification(high, low, opp_cand, i, InpDepth, 1, rates_total);
+            EvaluateATRReversal(high, low, opp_cand, i, 1);
+           }
+         EvaluateATRReversal(high, low, cand, i, -1);
+         
+         if(cand.bar_index != -1 && cand.depth_status == QUALIFIED && cand.is_atr_qualified && cand.has_valid_atr)
+           {
+            int confirmation_bar = (cand.depth_confirm_bar < cand.atr_confirm_bar) ? cand.depth_confirm_bar : cand.atr_confirm_bar;
+            if(i <= confirmation_bar)
+              {
+               ENUM_COMMIT_RESULT commit_res = CommitConfirmedPivot(cand, opp_cand, i, time, high, low, -1, rates_total);
+               if(commit_res == COMMIT_SUCCESS)
+                 {
+                  current_state = STATE_SEEKING_PEAK;
+                 }
+               else if(commit_res == COMMIT_RETRY)
+                 {
+                  last_rates_time = 0;
+                  last_rates_total = 0;
+                  return(0);
+                 }
+               else if(commit_res == COMMIT_REJECTED)
+                 {
+                  cand.depth_status = QUAL_REJECTED;
+                  cand.mode = CANDIDATE_RECOVERY;
+                 }
+               else if(commit_res == COMMIT_FATAL_ERROR)
+                 {
+                  Print("DTA Fatal Error: Commit failed with fatal error at bar ", i);
+                  last_rates_time = 0;
+                  last_rates_total = 0;
+                  return(0);
+                 }
+              }
+           }
+        }
+     }
+     
+   if(!PopulateSubArrays())
+     {
+      Print("DTA Error: PopulateSubArrays failed.");
+      last_rates_time = 0;
+      last_rates_total = 0;
+      return(0);
+     }
+   
+   for(int a = 0; a < ArraySize(all_pivots); a++)
+     {
+      if(all_pivots[a].type == 1) ZigZagHighBuffer[all_pivots[a].bar_index] = all_pivots[a].price;
+      if(all_pivots[a].type == -1) ZigZagLowBuffer[all_pivots[a].bar_index] = all_pivots[a].price;
+     }
+     
+   if(!ExecuteDualProjectionCore())
+     {
+      UpdateDTA10DashboardFields("CALCULATION ERROR", "CALCULATION ERROR", "CALCULATION ERROR", "N/A - N/A");
+      last_rates_time = 0;
+      last_rates_total = 0;
+      return(0);
+     }
+     
+   return(rates_total);
+  }
+
+//+------------------------------------------------------------------+
+//| MODULE 1: Cập nhật Extreme Candidate và reset trạng thái         |
+//+------------------------------------------------------------------+
+void UpdateExtremeCandidate(CandidateTracker &cand, int bar, double price, datetime t, double atr, double med, double k, double thresh, bool valid_atr)
+  {
+   cand.bar_index = bar;
+   cand.price = price;
+   cand.time = t;
+   cand.atr = atr;
+   cand.median = med;
+   cand.k = k;
+   cand.threshold = thresh;
+   cand.depth_status = QUAL_NOT_EVALUATED;
+   cand.depth_confirm_bar = -1;
+   cand.is_atr_qualified = false;
+   cand.atr_confirm_bar = -1;
+   cand.has_valid_atr = valid_atr;
+   cand.mode = CANDIDATE_ACTIVE;
+   cand.recovery_start_bar = -1;
+  }
+
+//+------------------------------------------------------------------+
+//| MODULE 2: Đánh giá Depth Qualification (Theo phương án A)        |
+//+------------------------------------------------------------------+
+void EvaluateDepthQualification(const double &high[], const double &low[], CandidateTracker &cand, int i, int depth, int type, int rates_total)
+  {
+   if(cand.depth_status != QUAL_NOT_EVALUATED || cand.mode != CANDIDATE_ACTIVE) return;
+   
+   int expected_depth_bar = cand.bar_index - depth;
+   if(expected_depth_bar < 0 || expected_depth_bar >= rates_total) return;
+   
+   if(i <= expected_depth_bar)
+     {
+      if(CheckSymmetricDepth(high, low, cand.bar_index, type, depth, rates_total))
+        {
+         cand.depth_status = QUALIFIED;
+         cand.depth_confirm_bar = expected_depth_bar;
+        }
+      else
+        {
+         cand.depth_status = QUAL_REJECTED;
+         cand.depth_confirm_bar = expected_depth_bar;
+         cand.mode = CANDIDATE_RECOVERY;
+         cand.recovery_start_bar = i;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| MODULE 3: Đánh giá ATR Reversal                                  |
+//+------------------------------------------------------------------+
+bool EvaluateATRReversal(const double &high[], const double &low[], CandidateTracker &cand, int i, int type)
+  {
+   if(cand.bar_index == -1 || cand.mode != CANDIDATE_ACTIVE || cand.is_atr_qualified || !cand.has_valid_atr) 
+      return(cand.is_atr_qualified);
+   
+   if(i < cand.bar_index)
+     {
+      if(type == 1) // Peak seeking confirmation
+        {
+         if((cand.price - low[i]) >= cand.threshold)
+           {
+            cand.is_atr_qualified = true;
+            cand.atr_confirm_bar = i;
+            return(true);
+           }
+        }
+      else if(type == -1) // Trough seeking confirmation
+        {
+         if((high[i] - cand.price) >= cand.threshold)
+           {
+            cand.is_atr_qualified = true;
+            cand.atr_confirm_bar = i;
+            return(true);
+           }
+        }
+     }
+   return(cand.is_atr_qualified);
+  }
+
+//+------------------------------------------------------------------+
+//| MODULE 4: Commit Confirmed Pivot với phân loại lỗi phân tầng xuyên suốt |
+//+------------------------------------------------------------------+
+ENUM_COMMIT_RESULT CommitConfirmedPivot(CandidateTracker &cand, CandidateTracker &opp_cand, int i, const datetime &time[], const double &high[], const double &low[], int type, int rates_total)
+  {
+   int condition_confirm_bar = (cand.depth_confirm_bar < cand.atr_confirm_bar) ? cand.depth_confirm_bar : cand.atr_confirm_bar;
+   if(condition_confirm_bar < 0) return(COMMIT_FATAL_ERROR);
+   
+   int sequence_confirm_bar = condition_confirm_bar;
+   if(sequence_confirm_bar > i) sequence_confirm_bar = i;
+   
+   datetime cond_time = time[condition_confirm_bar];
+   datetime seq_time  = time[sequence_confirm_bar];
+   
+   CandidateTracker next_cand = cand;
+   CandidateTracker next_opp  = opp_cand;
+   
+   ENUM_TRANSFER_RESULT transfer_res = TransferAndReconstructActiveCandidates(next_cand, next_opp, cand.bar_index, sequence_confirm_bar, high, low, time, AtrBuffer, type, rates_total);
+   if(transfer_res == TRANSFER_RETRY) return(COMMIT_RETRY);
+   if(transfer_res == TRANSFER_REJECTED) return(COMMIT_REJECTED);
+   if(transfer_res == TRANSFER_FATAL_ERROR) return(COMMIT_FATAL_ERROR);
+   
+   ENUM_DB_RESULT db_res = PushToChronologicalDatabase(cand.bar_index, cand.time, cand.price, type, cond_time, condition_confirm_bar, seq_time, sequence_confirm_bar, cand.atr, cand.median, cand.k, cand.threshold, high, low, rates_total);
+   if(db_res == DB_RETRY) return(COMMIT_RETRY);
+   if(db_res == DB_REJECTED) return(COMMIT_REJECTED);
+   if(db_res == DB_FATAL_ERROR) return(COMMIT_FATAL_ERROR);
+   
+   cand = next_cand;
+   opp_cand = next_opp;
+   
+   return(COMMIT_SUCCESS);
+  }
+
+//+------------------------------------------------------------------+
+//| MODULE 5: Bàn giao và Tái dựng an toàn (Audit D_28)              |
+//+------------------------------------------------------------------+
+ENUM_TRANSFER_RESULT TransferAndReconstructActiveCandidates(CandidateTracker &cand, CandidateTracker &opp_cand, int committed_bar, int confirm_bar, const double &high[], const double &low[], const datetime &time[], const double &atr_buf[], int committed_type, int rates_total)
+  {
+   if(committed_bar <= confirm_bar) return(TRANSFER_FATAL_ERROR);
+   
+   CandidateTracker new_cand = opp_cand;
+   bool valid_new_candidate = (new_cand.bar_index > confirm_bar && new_cand.bar_index < committed_bar && new_cand.has_valid_atr && new_cand.depth_status != QUAL_REJECTED && new_cand.mode == CANDIDATE_ACTIVE);
+   
+   if(valid_new_candidate)
+     {
+      cand = new_cand;
+     }
+   else
+     {
+      int target_cand_type = -committed_type;
+      int best_bar = committed_bar - 1;
+      double best_price = (target_cand_type == 1) ? high[best_bar] : low[best_bar];
+      
+      for(int idx = committed_bar - 2; idx > confirm_bar; --idx)
+        {
+         if(target_cand_type == 1)
+           {
+            if(high[idx] > best_price) { best_price = high[idx]; best_bar = idx; }
+           }
+         else
+           {
+            if(low[idx] < best_price)  { best_price = low[idx]; best_bar = idx; }
+           }
+        }
+      
+      if(best_bar <= confirm_bar || best_bar >= rates_total || best_bar + InpMedianPeriod > ArraySize(atr_buf)) return(TRANSFER_FATAL_ERROR);
+      
+      double ex_atr = atr_buf[best_bar];
+      bool ex_valid = (MathIsValidNumber(ex_atr) && ex_atr > 0 && ex_atr != EMPTY_VALUE);
+      double temp_atr[]; 
+      if(ArrayResize(temp_atr, InpMedianPeriod) != InpMedianPeriod) return(TRANSFER_RETRY); 
+      bool ex_med_valid = true;
+      for(int m = 0; m < InpMedianPeriod; m++)
+        {
+         temp_atr[m] = atr_buf[best_bar + m];
+         if(!MathIsValidNumber(temp_atr[m]) || temp_atr[m] <= 0 || temp_atr[m] == EMPTY_VALUE) ex_med_valid = false;
+        }
+      double ex_med = 0.0;
+      if(ex_med_valid)
+        {
+         ArraySort(temp_atr);
+         int mid = InpMedianPeriod / 2;
+         ex_med = (InpMedianPeriod % 2 == 0) ? (temp_atr[mid-1] + temp_atr[mid])/2.0 : temp_atr[mid];
+         if(!MathIsValidNumber(ex_med) || ex_med <= 0) ex_med_valid = false;
+        }
+      double ex_k = 1.0; double ex_thresh = 0.0;
+      if(ex_valid && ex_med_valid)
+        {
+         double ratio = ex_atr / ex_med;
+         ex_k = (ratio < 0.8) ? 0.8 : (ratio < 1.2) ? 1.0 : (ratio < 1.6) ? 1.5 : 2.0;
+         ex_thresh = ex_atr * ex_k;
+        }
+      
+      cand.bar_index = best_bar; cand.price = best_price; cand.time = time[best_bar];
+      cand.atr = (ex_valid && ex_med_valid) ? ex_atr : 0.0; cand.median = ex_med_valid ? ex_med : 0.0;
+      cand.k = ex_k; cand.threshold = ex_thresh;
+      cand.depth_status = QUAL_NOT_EVALUATED; cand.depth_confirm_bar = -1;
+      cand.is_atr_qualified = false; cand.atr_confirm_bar = -1;
+      cand.has_valid_atr = (ex_valid && ex_med_valid);
+      cand.mode = CANDIDATE_ACTIVE;
+      cand.recovery_start_bar = -1;
+     }
+     
+   int opp_target_type = committed_type;
+   int opp_search_limit = cand.bar_index - 1;
+   
+   if(opp_search_limit > confirm_bar)
+     {
+      int opp_best_bar = opp_search_limit;
+      double opp_best_price = (opp_target_type == 1) ? high[opp_best_bar] : low[opp_best_bar];
+      
+      for(int idx = opp_search_limit - 1; idx > confirm_bar; --idx)
+        {
+         if(opp_target_type == 1)
+           {
+            if(high[idx] > opp_best_price) { opp_best_price = high[idx]; opp_best_bar = idx; }
+           }
+         else
+           {
+            if(low[idx] < opp_best_price)  { opp_best_price = low[idx]; opp_best_bar = idx; }
+           }
+        }
+        
+      if(opp_best_bar > confirm_bar && opp_best_bar < rates_total && opp_best_bar + InpMedianPeriod <= ArraySize(atr_buf))
+        {
+         double op_atr = atr_buf[opp_best_bar];
+         bool op_valid = (MathIsValidNumber(op_atr) && op_atr > 0 && op_atr != EMPTY_VALUE);
+         double op_temp_temp[]; 
+         if(ArrayResize(op_temp_temp, InpMedianPeriod) != InpMedianPeriod) return(TRANSFER_RETRY); 
+         bool op_med_valid = true;
+         for(int m = 0; m < InpMedianPeriod; m++)
+           {
+            op_temp_temp[m] = atr_buf[opp_best_bar + m];
+            if(!MathIsValidNumber(op_temp_temp[m]) || op_temp_temp[m] <= 0 || op_temp_temp[m] == EMPTY_VALUE) op_med_valid = false;
+           }
+         double op_med = 0.0;
+         if(op_med_valid)
+           {
+            ArraySort(op_temp_temp);
+            int mid = InpMedianPeriod / 2;
+            op_med = (InpMedianPeriod % 2 == 0) ? (op_temp_temp[mid-1] + op_temp_temp[mid])/2.0 : op_temp_temp[mid];
+            if(!MathIsValidNumber(op_med) || op_med <= 0) op_med_valid = false;
+           }
+         double op_k = 1.0; double op_thresh = 0.0;
+         if(op_valid && op_med_valid)
+           {
+            double ratio = op_atr / op_med;
+            op_k = (ratio < 0.8) ? 0.8 : (ratio < 1.2) ? 1.0 : (ratio < 1.6) ? 1.5 : 2.0;
+            op_thresh = op_atr * op_k;
+           }
+           
+         opp_cand.bar_index = opp_best_bar; opp_cand.price = opp_best_price; opp_cand.time = time[opp_best_bar];
+         opp_cand.atr = (op_valid && op_med_valid) ? op_atr : 0.0; opp_cand.median = op_med_valid ? op_med : 0.0;
+         opp_cand.k = op_k; opp_cand.threshold = op_thresh;
+         opp_cand.depth_status = QUAL_NOT_EVALUATED; opp_cand.depth_confirm_bar = -1;
+         opp_cand.is_atr_qualified = false; opp_cand.atr_confirm_bar = -1;
+         opp_cand.has_valid_atr = (op_valid && op_med_valid);
+         opp_cand.mode = CANDIDATE_ACTIVE;
+         opp_cand.recovery_start_bar = -1;
+        }
+      else
+        {
+         ZeroMemory(opp_cand);
+         opp_cand.bar_index = -1;
+         opp_cand.mode = CANDIDATE_ACTIVE;
+        }
+     }
+   else
+     {
+      ZeroMemory(opp_cand);
+      opp_cand.bar_index = -1;
+      opp_cand.mode = CANDIDATE_ACTIVE;
+     }
+   
+   if(cand.bar_index <= opp_cand.bar_index && opp_cand.bar_index != -1)
+      return(TRANSFER_FATAL_ERROR);
+   if(cand.bar_index >= committed_bar)
+      return(TRANSFER_FATAL_ERROR);
+
+   return(TRANSFER_SUCCESS);
+  }
+
+//+------------------------------------------------------------------+
+//| Hàm kiểm tra độ sâu đối xứng 6 nến (Bảo vệ tràn biên mảng)        |
+//+------------------------------------------------------------------+
+bool CheckSymmetricDepth(const double &high[], const double &low[], int bar_index, int type, int depth, int rates_total)
+  {
+   if(bar_index - depth < 0 || bar_index + depth >= rates_total) return(false);
+   
+   for(int j = 1; j <= depth; j++)
+     {
+      if(type == 1) // Peak
+        {
+         if(high[bar_index] < high[bar_index + j] || high[bar_index] < high[bar_index - j]) return(false);
+        }
+      else if(type == -1) // Trough
+        {
+         if(low[bar_index] > low[bar_index + j] || low[bar_index] > low[bar_index - j]) return(false);
+        }
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| DATABASE TRANSACTION: Kiểm tra tính bất biến và toàn vẹn dữ liệu |
+//+------------------------------------------------------------------+
+ENUM_DB_RESULT PushToChronologicalDatabase(int bar, datetime t, double price, int type, datetime cond_t, int cond_b, datetime seq_t, int seq_b, double atr, double med, double k, double thresh, const double &high[], const double &low[], int rates_total)
+  {
+   if(!MathIsValidNumber(price) || price <= 0 || bar < 0 || bar >= rates_total) return(DB_REJECTED);
+   if(type != 1 && type != -1) return(DB_REJECTED);
+   
+   if(type == 1 && MathAbs(price - high[bar]) > 0.00001) return(DB_REJECTED);
+   if(type == -1 && MathAbs(price - low[bar]) > 0.00001) return(DB_REJECTED);
+
+   int sz = ArraySize(all_pivots);
+   if(sz > 0)
+     {
+      if(bar >= all_pivots[sz-1].bar_index) return(DB_FATAL_ERROR);
+      if(t <= all_pivots[sz-1].time) return(DB_FATAL_ERROR);
+      if(seq_t <= all_pivots[sz-1].sequence_confirmation_time) return(DB_FATAL_ERROR); 
+      if(all_pivots[sz-1].type == type) return(DB_FATAL_ERROR); 
+     }
+   
+   int peak_count = 0;
+   int trough_count = 0;
+   for(int i = 0; i < sz; i++)
+     {
+      if(all_pivots[i].type == 1) peak_count++;
+      else if(all_pivots[i].type == -1) trough_count++;
+     }
+     
+   int remove_count = 0;
+   if(type == 1 && peak_count >= InpMaxPivots) remove_count = 2;
+   else if(type == -1 && trough_count >= InpMaxPivots) remove_count = 2;
+   
+   if(remove_count > 0 && sz < remove_count) return(DB_FATAL_ERROR);
+   if(remove_count > 0 && all_pivots[0].type == all_pivots[1].type) return(DB_FATAL_ERROR);
+   
+   int new_sz = sz - remove_count + 1;
+   if(new_sz <= 0) return(DB_FATAL_ERROR);
+   
+   PivotPoint temp_db[];
+   if(ArrayResize(temp_db, new_sz) != new_sz) return(DB_RETRY); 
+   
+   int dest = 0;
+   for(int i = remove_count; i < sz; i++)
+     {
+      temp_db[dest++] = all_pivots[i];
+     }
+     
+   temp_db[dest].bar_index = bar; 
+   temp_db[dest].time = t; 
+   temp_db[dest].price = price; 
+   temp_db[dest].type = type;
+   temp_db[dest].condition_confirmation_time = cond_t;
+   temp_db[dest].condition_confirmation_bar = cond_b;
+   temp_db[dest].sequence_confirmation_time = seq_t;
+   temp_db[dest].sequence_confirmation_bar = seq_b;
+   temp_db[dest].confirmation_time = seq_t; 
+   temp_db[dest].confirmation_bar = seq_b;
+   temp_db[dest].atr_at_cand = atr; 
+   temp_db[dest].median_at_cand = med; 
+   temp_db[dest].k_at_cand = k; 
+   temp_db[dest].threshold_at_cand = thresh;
+   
+   if(dest != new_sz - 1) return(DB_FATAL_ERROR);
+   if(temp_db[new_sz - 1].bar_index != bar) return(DB_FATAL_ERROR);
+   if(temp_db[new_sz - 1].type != type) return(DB_FATAL_ERROR);
+
+   for(int k_idx = 1; k_idx < new_sz; k_idx++)
+     {
+      if(temp_db[k_idx].type == temp_db[k_idx-1].type) return(DB_FATAL_ERROR);
+     }
+   
+   if(!ArraySwap(all_pivots, temp_db)) return(DB_FATAL_ERROR);
+   
+   return(DB_SUCCESS);
+  }
+
+//+------------------------------------------------------------------+
+//| PopulateSubArrays trả về bool truyền lỗi lên cấp gọi             |
+//+------------------------------------------------------------------+
+bool PopulateSubArrays()
+  {
+   if(ArrayResize(tracked_peaks, 0) < 0 || ArrayResize(tracked_troughs, 0) < 0) return(false);
+   
+   for(int i = 0; i < ArraySize(all_pivots); i++)
+     {
+      if(all_pivots[i].type == 1)
+        {
+         int sz = ArraySize(tracked_peaks); 
+         if(ArrayResize(tracked_peaks, sz + 1) != sz + 1) return(false); 
+         tracked_peaks[sz] = all_pivots[i];
+        }
+      else if(all_pivots[i].type == -1)
+        {
+         int sz = ArraySize(tracked_troughs); 
+         if(ArrayResize(tracked_troughs, sz + 1) != sz + 1) return(false); 
+         tracked_troughs[sz] = all_pivots[i];
+        }
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| CalculateMedianInt có kiểm tra ArrayCopy an toàn                 |
+//+------------------------------------------------------------------+
+bool CalculateMedianInt(const int &values[], double &result)
+  {
+   int n = ArraySize(values);
+   if(n <= 0) 
+     {
+      result = 0.0;
+      return(false);
+     }
+     
+   int sorted[]; 
+   if(ArrayResize(sorted, n) != n) 
+     {
+      result = 0.0;
+      return(false);
+     }
+     
+   if(ArrayCopy(sorted, values) != n)
+     {
+      result = 0.0;
+      return(false);
+     }
+     
+   ArraySort(sorted);
+   
+   if(n % 2 == 1) 
+      result = (double)sorted[n / 2];
+   else 
+      result = ((double)sorted[n / 2 - 1] + (double)sorted[n / 2]) / 2.0;
+      
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| TẦNG 4 & 5: PHÂN LOẠI MỤC TIÊU FORECAST TARGET                   |
+//+------------------------------------------------------------------+
+bool ExecuteDualProjectionCore()
+  {
+   int p_size = ArraySize(tracked_peaks);
+   int t_size = ArraySize(tracked_troughs);
+   int all_size = ArraySize(all_pivots);
+   
+   if(all_size < 6)
+     {
+      UpdateDTA10DashboardFields("INSUFFICIENT SAMPLE", "INSUFFICIENT SAMPLE", "INSUFFICIENT SAMPLE (INCOMPLETE DATA)", "N/A - N/A");
+      return(true);
+     }
+   
+   bool ind_ready = false;
+   bool alt_ready = false;
+   
+   double median_hh = 0.0, median_ll = 0.0, median_pt = 0.0, median_tp = 0.0;
+   int ind_start_bars = 0, ind_end_bars = 0;
+   int alt_start_bars = 0, alt_end_bars = 0;
+   
+   int last_pivot_type = all_pivots[all_size-1].type;
+   int b_peak   = (p_size > 0) ? tracked_peaks[p_size - 1].bar_index : 0;     
+   int b_trough = (t_size > 0) ? tracked_troughs[t_size - 1].bar_index : 0; 
+   
+   // Đánh giá Independent độc lập
+   if(p_size > InpMinCycles && t_size > InpMinCycles)
+     {
+      int hh_diffs[]; 
+      if(ArrayResize(hh_diffs, p_size - 1) != p_size - 1) return(false);
+      for(int m = 0; m < p_size - 1; m++) hh_diffs[m] = (int)MathAbs(tracked_peaks[m].bar_index - tracked_peaks[m+1].bar_index);
+      
+      int ll_diffs[]; 
+      if(ArrayResize(ll_diffs, t_size - 1) != t_size - 1) return(false);
+      for(int m = 0; m < t_size - 1; m++) ll_diffs[m] = (int)MathAbs(tracked_troughs[m].bar_index - tracked_troughs[m+1].bar_index);
+      
+      double med_hh_val = 0.0, med_ll_val = 0.0;
+      if(!CalculateMedianInt(hh_diffs, med_hh_val)) return(false);
+      if(!CalculateMedianInt(ll_diffs, med_ll_val)) return(false);
+      
+      median_hh = med_hh_val;
+      median_ll = med_ll_val;
+      
+      if(median_hh > 0 && median_ll > 0)
+        {
+         ind_ready = true;
+         int cycle_low = 0, cycle_high = 0;
+         
+         if(last_pivot_type == -1) 
+           {
+            cycle_low  = (int)MathRound(median_hh * 0.9);
+            cycle_high = (int)MathRound(median_hh * 1.1);
+            ind_start_bars = b_peak - cycle_high; 
+            ind_end_bars   = b_peak - cycle_low;
+           }
+         else 
+           {
+            cycle_low  = (int)MathRound(median_ll * 0.9);
+            cycle_high = (int)MathRound(median_ll * 1.1);
+            ind_start_bars = b_trough - cycle_high;
+            ind_end_bars   = b_trough - cycle_low;
+           }
+        }
+     }
+     
+   // Đánh giá Alternating độc lập
+   int pt_diffs[]; int tp_diffs[];
+   ArrayResize(pt_diffs, 0); ArrayResize(tp_diffs, 0);
+   for(int m = 0; m < all_size - 1; m++)
+     {
+      int dist = (int)MathAbs(all_pivots[m].bar_index - all_pivots[m+1].bar_index);
+      if(dist <= 0) continue;
+      if(all_pivots[m].type == 1 && all_pivots[m+1].type == -1)
+        {
+         int sz = ArraySize(pt_diffs); 
+         if(ArrayResize(pt_diffs, sz + 1) != sz + 1) return(false); 
+         pt_diffs[sz] = dist;
+        }
+      else if(all_pivots[m].type == -1 && all_pivots[m+1].type == 1)
+        {
+         int sz = ArraySize(tp_diffs); 
+         if(ArrayResize(tp_diffs, sz + 1) != sz + 1) return(false); 
+         tp_diffs[sz] = dist;
+        }
+     }
+     
+   if(ArraySize(pt_diffs) >= InpMinCycles && ArraySize(tp_diffs) >= InpMinCycles)
+     {
+      double med_pt_val = 0.0, med_tp_val = 0.0;
+      if(!CalculateMedianInt(pt_diffs, med_pt_val)) return(false);
+      if(!CalculateMedianInt(tp_diffs, med_tp_val)) return(false);
+      
+      median_pt = med_pt_val;
+      median_tp = med_tp_val;
+      
+      if(median_pt > 0 && median_tp > 0)
+        {
+         alt_ready = true;
+         int cycle_low = 0, cycle_high = 0;
+         
+         if(last_pivot_type == -1) 
+           {
+            cycle_low  = (int)MathRound(median_tp * 0.85);
+            cycle_high = (int)MathRound(median_tp * 1.15);
+            alt_start_bars = b_trough - cycle_high; 
+            alt_end_bars   = b_trough - cycle_low;
+           }
+         else 
+           {
+            cycle_low  = (int)MathRound(median_pt * 0.85);
+            cycle_high = (int)MathRound(median_pt * 1.15);
+            alt_start_bars = b_peak - cycle_high;
+            alt_end_bars   = b_peak - cycle_low;
+           }
+        }
+     }
+     
+   string ind_str = ind_ready ? StringFormat("[%d - %d] nến", ind_start_bars, ind_end_bars) : "INSUFFICIENT SAMPLE";
+   string alt_str = alt_ready ? StringFormat("[%d - %d] nến", alt_start_bars, alt_end_bars) : "INSUFFICIENT SAMPLE";
+   
+   if(!ind_ready || !alt_ready)
+     {
+      UpdateDTA10DashboardFields(ind_str, alt_str, "INSUFFICIENT SAMPLE (MODELS NOT READY)", "N/A - N/A");
+      return(true);
+     }
+     
+   int core_start = (ind_start_bars > alt_start_bars) ? ind_start_bars : alt_start_bars;
+   int core_end   = (ind_end_bars < alt_end_bars) ? ind_end_bars : alt_end_bars;
+   
+   if(core_start > core_end)
+     {
+      UpdateDTA10DashboardFields(ind_str, alt_str, "NO CONFLUENCE", "N/A - N/A");
+      WriteStatefulLog("NO CONFLUENCE", 0, 0, median_hh, median_ll, median_pt, median_tp);
+      return(true);
+     }
+     
+   if(core_end < 0) 
+     {
+      UpdateDTA10DashboardFields(ind_str, alt_str, "NO CONFLUENCE (PAST ZONE)", "N/A - N/A");
+      return(true);
+     }
+     
+   if(core_start < 0) core_start = 0;
+   
+   string core_text  = StringFormat("[%d - %d] BARS CONFLUENCE", core_start, core_end);
+   string window_str = StringFormat("Còn lại: %d - %d nến", core_start, core_end);
+   
+   UpdateDTA10DashboardFields(ind_str, alt_str, core_text, window_str);
+   WriteStatefulLog("CONFLUENCE", core_start, core_end, median_hh, median_ll, median_pt, median_tp);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| TẦNG 7: Hệ thống Nhật ký Mở rộng                                 |
+//+------------------------------------------------------------------+
+void WriteStatefulLog(string status, int start_b, int end_b, double m_hh, double m_ll, double m_pt, double m_tp)
+  {
+   int last_idx = ArraySize(all_pivots) - 1;
+   if(last_idx < 0) return;
+   
+   string current_pivot_signature = StringFormat("Time_%s_Price_%.5f_Type_%d", TimeToString(all_pivots[last_idx].time, TIME_DATE|TIME_SECONDS), all_pivots[last_idx].price, all_pivots[last_idx].type);
+   if(status == last_logged_status && start_b == last_logged_start && end_b == last_logged_end && current_pivot_signature == last_logged_pivot_sign) return;
+   
+   int file_handle = FileOpen(InpLogFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
+   if(file_handle != INVALID_HANDLE)
+     {
+      FileSeek(file_handle, 0, SEEK_END);
+      if(FileSize(file_handle) == 0)
+        {
+         FileWrite(file_handle, "Symbol", "Timeframe", "Trang_Thai", "Forecast_Start", "Forecast_End", "Ref_Pivot_Bar", "Ref_Pivot_Price", "Ref_Pivot_Type", "Pivot_Time", "Condition_Confirmation_Time", "Sequence_Confirmation_Time", "ATR", "Median_ATR", "K_t", "Threshold", "Median_Peak_to_Peak", "Median_Trough_to_Trough", "Median_PT", "Median_TP");
+        }
+      FileWrite(file_handle, _Symbol, EnumToString(_Period), status, start_b, end_b, all_pivots[last_idx].bar_index,
+                  DoubleToString(all_pivots[last_idx].price, _Digits), all_pivots[last_idx].type, TimeToString(all_pivots[last_idx].time, TIME_DATE|TIME_SECONDS), 
+                  TimeToString(all_pivots[last_idx].condition_confirmation_time, TIME_DATE|TIME_SECONDS), TimeToString(all_pivots[last_idx].sequence_confirmation_time, TIME_DATE|TIME_SECONDS),
+                  DoubleToString(all_pivots[last_idx].atr_at_cand, _Digits), DoubleToString(all_pivots[last_idx].median_at_cand, _Digits), StringFormat("%.1f", all_pivots[last_idx].k_at_cand), DoubleToString(all_pivots[last_idx].threshold_at_cand, _Digits),
+                  StringFormat("%.1f", m_hh), StringFormat("%.1f", m_ll), StringFormat("%.1f", m_pt), StringFormat("%.1f", m_tp));
+      FileClose(file_handle);
+      
+      last_logged_status = status; last_logged_start = start_b; last_logged_end = end_b; last_logged_pivot_sign = current_pivot_signature;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| TẦNG 6: Giao diện Đồ họa Dashboard DTA 1.0                       |
+//+------------------------------------------------------------------+
+void CreateDTA10Dashboard()
+  {
+   int x_label = 550; int x_val = 140;
+   color clrHeader = clrCyan; color clrText = clrWhite;
+   
+   CreateDTA10Label("Title", " DTA ENGINE VERSION 1.0 (PRODUCTION STANDARD) ", x_label, 20, 10, clrHeader);
+   CreateDTA10Label("Head_Ind", "Independent Range Remaining:", x_label, 45, 9, clrText);
+   CreateDTA10Label("Val_Ind", "Scanning...", x_val, 45, 9, clrYellow);
+   CreateDTA10Label("Head_Alt", "Alternating Range Remaining:", x_label, 65, 9, clrText);
+   CreateDTA10Label("Val_Alt", "Scanning...", x_val, 65, 9, clrYellow);
+   CreateDTA10Label("Head_Core", "CORE CONFLUENCE ZONE:", x_label, 95, 9, clrText);
+   CreateDTA10Label("Val_Core", "Analyzing...", x_val, 95, 9, clrOrange);
+   CreateDTA10Label("Head_Time", "Estimated Time Window:", x_label, 115, 9, clrText);
+   CreateDTA10Label("Val_Time", "Waiting...", x_val, 115, 9, clrCyan);
+  }
+
+void CreateDTA10Label(string name, string text, int x, int y, int size, color col)
+  {
+   string obj_name = "DTA10_" + name;
+   if(ObjectFind(0, obj_name) < 0)
+     {
+      int created = ObjectCreate(0, obj_name, OBJ_LABEL, 0, 0, 0);
+      if(created <= 0) return;
+     }
+   ObjectSetInteger(0, obj_name, OBJPROP_XDISTANCE, x); 
+   ObjectSetInteger(0, obj_name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, obj_name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetString(0, obj_name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, obj_name, OBJPROP_FONTSIZE, size); 
+   ObjectSetInteger(0, obj_name, OBJPROP_COLOR, col);
+  }
+
+void UpdateDTA10DashboardFields(string ind, string alt, string core, string est_time)
+  {
+   if(ObjectFind(0, "DTA10_Val_Ind") >= 0) UpdateDTA10Field("Val_Ind", ind);
+   if(ObjectFind(0, "DTA10_Val_Alt") >= 0) UpdateDTA10Field("Val_Alt", alt);
+   if(ObjectFind(0, "DTA10_Val_Core") >= 0) UpdateDTA10Field("Val_Core", core);
+   if(ObjectFind(0, "DTA10_Val_Time") >= 0) UpdateDTA10Field("Val_Time", est_time);
+  }
+
+//+------------------------------------------------------------------+
+//| Cập nhật giá trị trường trên Dashboard                           |
+//+------------------------------------------------------------------+
+void UpdateDTA10Field(string name, string text)
+  {
+   ObjectSetString(0, "DTA10_" + name, OBJPROP_TEXT, text);
+   ChartRedraw();
+  }
